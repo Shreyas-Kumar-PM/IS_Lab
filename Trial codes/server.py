@@ -1,137 +1,119 @@
 import socket
 import json
-from typing import Tuple, Dict, List
+from typing import Tuple
 from Crypto.PublicKey import RSA
-from Crypto.Cipher import PKCS1_OAEP
-from Crypto.Hash import SHA256
 from Crypto.Signature import pkcs1_15
-from Crypto.Random import random
-from math import gcd
-from functools import reduce
+from Crypto.Hash import SHA256
+from phe import paillier  # pip install phe
 
-# ========== PAILLIER ENCRYPTION IMPLEMENTATION ==========
-def lcm(a, b): return a * b // gcd(a, b)
 
-def modinv(a, m):
-    def egcd(a, b):
-        if b == 0: return (1, 0, a)
-        x, y, g = egcd(b, a % b)
-        return (y, x - (a // b) * y, g)
-    x, y, g = egcd(a, m)
-    if g != 1: raise ValueError("No modular inverse")
-    return x % m
+# ============================================================
+# 1️⃣ Key Generation (RSA + Paillier)
+# ============================================================
 
-class PaillierPublicKey:
-    def __init__(self, n, g):
-        self.n = n
-        self.g = g
-        self.n2 = n * n
-
-class PaillierPrivateKey:
-    def __init__(self, lam, mu):
-        self.lam = lam
-        self.mu = mu
-
-def paillier_keygen(bits=256):
-    from Crypto.Util import number
-    p = number.getPrime(bits // 2)
-    q = number.getPrime(bits // 2)
-    n = p * q
-    g = n + 1
-    lam = lcm(p - 1, q - 1)
-    n2 = n * n
-    def L(u): return (u - 1) // n
-    mu = modinv(L(pow(g, lam, n2)), n)
-    return PaillierPublicKey(n, g), PaillierPrivateKey(lam, mu)
-
-def paillier_encrypt(pub, m):
-    from Crypto.Random import random
-    r = random.StrongRandom().randint(1, pub.n - 1)
-    return (pow(pub.g, m, pub.n2) * pow(r, pub.n, pub.n2)) % pub.n2
-
-def paillier_decrypt(pub, priv, c):
-    def L(u): return (u - 1) // pub.n
-    return (L(pow(c, priv.lam, pub.n2)) * priv.mu) % pub.n
-
-def paillier_add(pub, c_list):
-    result = 1
-    for c in c_list:
-        result = (result * c) % pub.n2
-    return result
-
-# ========================================================
-
-def generate_rsa(bits: int = 2048) -> Tuple[RSA.RsaKey, RSA.RsaKey]:
+def generate_rsa_keys(bits: int = 2048) -> Tuple[RSA.RsaKey, RSA.RsaKey]:
+    """Generate RSA public and private key pair for digital signing."""
     key = RSA.generate(bits)
     return key.publickey(), key
 
 
-def main() -> None:
+def generate_paillier_keys():
+    """Generate Paillier public and private key pair for encryption."""
+    pub, priv = paillier.generate_paillier_keypair()
+    return pub, priv
+
+
+# ============================================================
+# 2️⃣ Transaction Processing and Decryption
+# ============================================================
+
+def compute_totals(paillier_pub, paillier_priv, transactions):
+    """
+    Perform homomorphic addition of encrypted transactions,
+    then decrypt totals per seller.
+    """
+    summary = []
+
+    for seller, tx_list in transactions.items():
+        total_enc = None
+        total_plain = 0
+
+        for enc_val, plain in tx_list:
+            enc_num = paillier.EncryptedNumber(paillier_pub, enc_val)
+            total_enc = enc_num if total_enc is None else total_enc + enc_num
+            total_plain += plain
+
+        decrypted_total = paillier_priv.decrypt(total_enc)
+
+        summary.append({
+            "seller": seller,
+            "transaction_count": len(tx_list),
+            "total_plain_sum": total_plain,
+            "total_decrypted_amount": decrypted_total
+        })
+
+    return summary
+
+
+# ============================================================
+# 3️⃣ Digital Signature Generation (RSA + SHA-256)
+# ============================================================
+
+def sign_summary(summary, rsa_priv):
+    """Sign the SHA-256 hash of the transaction summary."""
+    summary_json = json.dumps(summary, indent=2)
+    hash_obj = SHA256.new(summary_json.encode())
+    signature = pkcs1_15.new(rsa_priv).sign(hash_obj)
+    return signature, summary_json
+
+
+# ============================================================
+# 4️⃣ Server Main Function (Network I/O)
+# ============================================================
+
+def main():
     host = "127.0.0.1"
-    port = 5005
+    port = 5003
 
     # Generate keys
-    pub_pail, priv_pail = paillier_keygen()
-    pub_rsa, priv_rsa = generate_rsa(2048)
-    rsa_pub_pem = pub_rsa.export_key()
+    rsa_pub, rsa_priv = generate_rsa_keys()
+    paillier_pub, paillier_priv = generate_paillier_keys()
 
-    # Store transactions from sellers
-    all_sellers: Dict[str, Dict] = {}
+    print("💳 Payment Gateway Server Running...")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
         srv.bind((host, port))
-        srv.listen(5)
-        print(f"[SERVER] Payment Gateway listening on {host}:{port}")
+        srv.listen(1)
+        conn, addr = srv.accept()
 
-        for _ in range(2):  # Expecting two sellers
-            conn, _ = srv.accept()
-            with conn:
-                # Step 1: Send Paillier + RSA public key info
-                pub_data = {
-                    "paillier_n": str(pub_pail.n),
-                    "paillier_g": str(pub_pail.g),
-                    "rsa_pub": rsa_pub_pem.decode()
-                }
-                data = json.dumps(pub_data).encode()
-                conn.sendall(len(data).to_bytes(4, "big") + data)
+        with conn:
+            print(f"✅ Connected with {addr}")
 
-                # Step 2: Receive seller transactions
-                length = int.from_bytes(conn.recv(4), "big")
-                payload = conn.recv(length)
-                seller_data = json.loads(payload.decode())
+            # Send Paillier public key (n) to client
+            conn.sendall(str(paillier_pub.n).encode())
+            conn.recv(1024)  # wait for ack
 
-                name = seller_data["seller_name"]
-                tx_plain = seller_data["transactions_plain"]
-                tx_encrypted = [int(x) for x in seller_data["transactions_encrypted"]]
+            # Receive encrypted transactions
+            data = conn.recv(8192)
+            transactions = json.loads(data.decode())
 
-                total_enc = paillier_add(pub_pail, tx_encrypted)
-                total_dec = paillier_decrypt(pub_pail, priv_pail, total_enc)
-                dec_individual = [paillier_decrypt(pub_pail, priv_pail, c) for c in tx_encrypted]
+            # Compute totals
+            summary = compute_totals(paillier_pub, paillier_priv, transactions)
 
-                all_sellers[name] = {
-                    "Seller": name,
-                    "Individual Transactions": tx_plain,
-                    "Encrypted Transactions": tx_encrypted,
-                    "Decrypted Transactions": dec_individual,
-                    "Total Encrypted": total_enc,
-                    "Total Decrypted": total_dec
-                }
+            # Sign the summary
+            signature, summary_json = sign_summary(summary, rsa_priv)
 
-                conn.sendall(len(b"ACK").to_bytes(4, "big") + b"ACK")
+            # Prepare payload to send
+            payload = json.dumps({
+                "summary": summary,
+                "signature": signature.hex(),
+                "rsa_pub": rsa_pub.export_key().decode()
+            })
+            conn.sendall(payload.encode())
 
-        # Build summary after all sellers sent data
-        summary = json.dumps(all_sellers, indent=2).encode()
-        h = SHA256.new(summary)
-        signature = pkcs1_15.new(priv_rsa).sign(h)
-
-        print("\n===== TRANSACTION SUMMARY =====")
-        print(summary.decode())
-        print("===============================")
-        print(f"[SERVER] SHA256 hash: {h.hexdigest()}")
-        print(f"[SERVER] Digital Signature (hex): {signature.hex()[:64]}...")
-
-        # Broadcast summary + signature to sellers (demo)
-        print("[SERVER] Summary signed and stored as proof.")
+            print("\n📦 Sent Signed Summary to Client.")
+            print("🧾 Transaction Summary:")
+            print(summary_json)
 
 
 if __name__ == "__main__":
