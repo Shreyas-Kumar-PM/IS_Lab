@@ -1,54 +1,84 @@
 import socket
 import json
+from phe import paillier
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 from Crypto.Hash import SHA256
 
-def paillier_encrypt(n, g, m):
-    from Crypto.Random import random
-    n2 = n * n
-    r = random.StrongRandom().randint(1, n - 1)
-    return (pow(g, m, n2) * pow(r, n, n2)) % n2
 
-def main() -> None:
+# ============================================================
+# 1️⃣ Prepare Seller Transactions
+# ============================================================
+
+def prepare_transactions(paillier_pub):
+    """Encrypt transaction amounts for multiple sellers."""
+    sellers = {
+        "Seller_A": [100, 250],
+        "Seller_B": [150, 200, 50]
+    }
+
+    encrypted_data = {}
+    for seller, amounts in sellers.items():
+        encrypted_data[seller] = []
+        for amt in amounts:
+            enc_val = paillier_pub.encrypt(amt)
+            encrypted_data[seller].append((enc_val.ciphertext(), amt))
+    return encrypted_data
+
+
+# ============================================================
+# 2️⃣ Verify Digital Signature (RSA + SHA-256)
+# ============================================================
+
+def verify_signature(summary, signature_hex, rsa_pub_pem):
+    """Verify the digital signature received from server."""
+    rsa_pub = RSA.import_key(rsa_pub_pem)
+    signature = bytes.fromhex(signature_hex)
+    summary_json = json.dumps(summary, indent=2)
+    hash_obj = SHA256.new(summary_json.encode())
+
+    try:
+        pkcs1_15.new(rsa_pub).verify(hash_obj, signature)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+# ============================================================
+# 3️⃣ Client Main Function (Network I/O)
+# ============================================================
+
+def main():
     host = "127.0.0.1"
-    port = 5005
-
-    seller_name = input("Enter Seller Name: ")
-    transactions = list(map(int, input("Enter transaction amounts (space-separated): ").split()))
+    port = 5003
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as cli:
         cli.connect((host, port))
 
-        # Step 1: Receive public keys
-        plen = int.from_bytes(cli.recv(4), "big")
-        pdata = cli.recv(plen)
-        keys = json.loads(pdata.decode())
-        n = int(keys["paillier_n"])
-        g = int(keys["paillier_g"])
-        rsa_pub = RSA.import_key(keys["rsa_pub"])
+        # Receive Paillier public key (n)
+        n_val = int(cli.recv(4096).decode())
+        paillier_pub = paillier.PaillierPublicKey(n_val)
+        cli.sendall(b"ACK")
 
-        # Step 2: Encrypt transactions using Paillier
-        enc_tx = [str(paillier_encrypt(n, g, amt)) for amt in transactions]
-        seller_payload = {
-            "seller_name": seller_name,
-            "transactions_plain": transactions,
-            "transactions_encrypted": enc_tx
-        }
+        # Prepare and send transactions
+        encrypted_data = prepare_transactions(paillier_pub)
+        cli.sendall(json.dumps(encrypted_data).encode())
 
-        msg = json.dumps(seller_payload).encode()
-        cli.sendall(len(msg).to_bytes(4, "big") + msg)
+        # Receive summary + signature
+        response = cli.recv(8192)
+        resp_data = json.loads(response.decode())
 
-        # Step 3: Receive ACK
-        alen = int.from_bytes(cli.recv(4), "big")
-        ack = cli.recv(alen).decode()
-        print(f"[CLIENT] Server replied: {ack}")
+        summary = resp_data["summary"]
+        signature = resp_data["signature"]
+        rsa_pub_pem = resp_data["rsa_pub"]
 
-        print("\n[CLIENT] Transactions Encrypted and Sent Successfully!")
-        for i, (p, e) in enumerate(zip(transactions, enc_tx)):
-            print(f"  Tx{i+1}: {p} -> Ciphertext (truncated): {e[:60]}...")
+        # Verify signature
+        is_valid = verify_signature(summary, signature, rsa_pub_pem)
 
-    print("\n[CLIENT] Waiting for server's signed summary (see server output).")
+        print("\n=== 💰 Transaction Summary ===")
+        print(json.dumps(summary, indent=2))
+        print(f"\n🔐 Digital Signature Verification: {'✅ VALID' if is_valid else '❌ INVALID'}")
+
 
 if __name__ == "__main__":
     main()
